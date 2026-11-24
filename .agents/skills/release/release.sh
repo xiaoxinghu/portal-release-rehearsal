@@ -13,8 +13,9 @@
 # hashes that directory.
 # PORTAL_RELEASE_REMOTE and GH_REPO name another repository to release, for
 # the tests and a rehearsal, PORTAL_RELEASE_DOWNLOADS where anyone downloads
-# its releases' assets, and PORTAL_RELEASE_RETRIES how often a download is
-# tried again.
+# its releases' assets, PORTAL_RELEASE_RETRIES how often a download is
+# tried again, and PORTAL_RELEASE_SETTLE how often GitHub is asked again
+# for a change it does not list yet.
 set -eu
 
 die() { echo "release: $*" >&2; exit 1; }
@@ -22,14 +23,22 @@ die() { echo "release: $*" >&2; exit 1; }
 suites="python views input launcher terminal-shell-startup package"
 largest() { sort -t. -k1,1n -k2,2n -k3,3n | tail -1; }
 sha256() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
-# The runtimes a release attaches, an archive and its manifest each. The
-# candidate's run packs Linux's too, but an install on Linux downloads as
-# soon as its release holds a Linux manifest, so they stay out until
-# runtime-linux-download-rollout adds linux-x86_64-gnu and linux-aarch64-gnu.
-targets=macos-arm64
+# The runtimes a release attaches, an archive and its manifest each, packed
+# by the candidate's run: the Mac's in its job, each Linux CPU's in its own.
+targets="macos-arm64 linux-x86_64-gnu linux-aarch64-gnu"
+
+# The directory of $work holding the logs of target $1's job: the Mac job's
+# are the run's `logs`, each Linux job's its `logs-TARGET`.
+logs_of() {
+    case $1 in
+        macos-*) echo "$work/logs" ;;
+        *) echo "$work/logs-$1" ;;
+    esac
+}
 
 # Set `release` to the release commit of version $1, `run` to its green Checks
-# run, and put that run's logs in $work/logs; only an uncached full run is evidence.
+# run, and put the logs of each of its jobs in $work, as logs_of names them;
+# only an uncached full run is evidence, in every job.
 evidence() {
     release=$(git rev-parse -q --verify "origin/release/v$1^{commit}") ||
         die "no release/v$1 on GitHub: run candidate first"
@@ -38,11 +47,15 @@ evidence() {
     run=$(gh run list --workflow checks.yml --commit "$release" --json databaseId,conclusion \
         --jq '[.[] | select(.conclusion == "success")][0].databaseId // empty')
     [ -n "$run" ] || die "no green Checks run of $release"
-    gh run download "$run" -n logs -D "$work/logs" >&2
-    grep -qx 'USE_CACHE=false' "$work/logs/environment.log" ||
-        die "Checks run $run restored cached downloads: it is no evidence"
-    grep -qx 'PORTAL_TEST_EXPENSIVE=1' "$work/logs/environment.log" ||
-        die "Checks run $run left out the full set's checks: it is no evidence"
+    for target in $targets; do
+        logs=$(logs_of "$target")
+        gh run download "$run" -n "${logs#"$work/"}" -D "$logs" >&2 ||
+            die "Checks run $run keeps no ${logs#"$work/"}: a run keeps its logs 14 days"
+        grep -qx 'USE_CACHE=false' "$logs/environment.log" ||
+            die "Checks run $run restored cached downloads: it is no evidence"
+        grep -qx 'PORTAL_TEST_EXPENSIVE=1' "$logs/environment.log" ||
+            die "Checks run $run left out the full set's checks: it is no evidence"
+    done
 }
 
 # Set `hash` to the hash of what the native build reads at commit $1, as
@@ -88,9 +101,14 @@ runtimes() {
 }
 
 # Check the manifest of version $2's runtime for target $3 in directory $1,
-# and the archive beside it: the tag, the version, the release commit, and
-# the archive's name, size and SHA-256.
+# and the archive beside it: the manifest is the one run $run packed after
+# its checks passed, a copy of which the logs of the job that packed it keep,
+# so the archive's SHA-256 in it is that of the archive they tested; then the
+# tag, the version, the release commit, and the archive's name, size and
+# SHA-256.
 check_runtime() {
+    cmp -s "$1/portal-runtime-v$2-$3.json" "$(logs_of "$3")/runtime/portal-runtime-v$2-$3.json" ||
+        die "$1 holds a manifest of v$2 for $3 other than the one Checks run $run packed"
     python3 -I - "$1" "$2" "$3" "$release" <<'PYTHON' || die "$1 holds no runtime of v$2 for $3"
 import hashlib, json, sys
 from pathlib import Path
@@ -139,12 +157,23 @@ EOF
     if [ "$new" = "$current" ] || [ "$(printf '%s\n' "$current" "$new" | largest)" != "$new" ]; then
         die "$new is not above $current, the current version"
     fi
-    if [ -n "$last" ]; then
-        [ "$(gh release view "v$last" --json isDraft --jq .isDraft 2>/dev/null)" = false ] ||
-            die "v$last has no published GitHub release: publish it first"
-        [ "$(git rev-parse -q --verify origin/stable || :)" = "$(git rev-parse "v$last^{commit}")" ] ||
-            die "stable is not at v$last: publish v$last again to finish it"
-        [ -n "$(git rev-list -1 "v$last..$base")" ] || die "$from has nothing new since v$last"
+    # The last finished release, newest first: one the owner marked a
+    # pre-release is abandoned, passed over; any other unfinished one stops it.
+    finished=''
+    for version in $(git tag -l | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
+        sort -t. -k1,1nr -k2,2nr -k3,3nr); do
+        case $(gh release view "v$version" --json isDraft,isPrerelease \
+            --jq '"\(.isDraft) \(.isPrerelease)"' 2>/dev/null) in
+            'false false') finished=$version; break ;;
+            'false true') echo "release: v$version is a pre-release: passed over as abandoned" >&2 ;;
+            *) die "v$version has no published GitHub release: publish it first" ;;
+        esac
+    done
+    if [ -n "$finished" ]; then
+        [ "$(git rev-parse -q --verify origin/stable || :)" = "$(git rev-parse "v$finished^{commit}")" ] ||
+            die "stable is not at v$finished: publish v$finished again to finish it, or" \
+                "mark it a pre-release to abandon it"
+        [ -n "$(git rev-list -1 "v$finished..$base")" ] || die "$from has nothing new since v$finished"
     fi
     if git rev-parse -q --verify origin/stable >/dev/null; then
         git merge-base --is-ancestor origin/stable "$base" ||
@@ -176,7 +205,8 @@ EOF
 
 notes() {
     evidence "$1"
-    previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$release" 2>/dev/null || :)
+    # From the base: once publish has pushed the tag, the release commit has its own.
+    previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$release^" 2>/dev/null || :)
     echo "## What is new"
     echo
     if [ -z "$previous" ]; then
@@ -233,29 +263,44 @@ notes() {
     echo "Counts, as each suite printed them:"
     echo
     # CTest's own log holds every suite's output, between "N/M Test: NAME" and
-    # "Test Passed."; the other steps log to a file each. A suite with no
-    # count stops the notes: the evidence must be whole.
-    awk '/^[0-9]+\/[0-9]+ Test: / { suite = $3; counts = "" }
-         /^Ran [0-9]+ tests|^[0-9]+ checks passed|Test run with [0-9]+ tests/ {
-             sub(/^[^A-Za-z0-9]+/, ""); counts = counts "; " $0 }
-         /^Test Passed\./ { suites++; print "- CTest " suite ": passed" counts
-             if (counts == "") { print "release: no count for the CTest suite " suite >"/dev/stderr"; bad = 1 } }
-         END { exit bad || !suites }' "$work/logs/ctest.log" ||
-        die "ctest.log does not count every suite's tests"
-    for name in $suites; do
-        counts=$(sed -n "s/^Ran [0-9]* tests.*/- $name: &/p; s/^[0-9]* checks passed.*/- $name: &/p" \
-            "$work/logs/$name.log" "$work/logs/$name/test.log" 2>/dev/null || :)
-        [ -n "$counts" ] || die "the run's logs do not count $name's tests"
-        echo "$counts"
+    # "Test Passed."; the other steps log to a file each. Each job counts its
+    # own, a Linux job's named by its target. A suite with no count stops the
+    # notes: the evidence must be whole.
+    for target in $targets; do
+        logs=$(logs_of "$target")
+        case $target in
+            macos-*) label='' names=$suites ;;
+            *) label="$target " names=python ;;
+        esac
+        awk -v label="$label" '
+             /^[0-9]+\/[0-9]+ Test: / { suite = $3; counts = "" }
+             /^Ran [0-9]+ tests|^[0-9]+ checks passed|Test run with [0-9]+ tests/ {
+                 sub(/^[^A-Za-z0-9]+/, ""); counts = counts "; " $0 }
+             /^Test Passed\./ { suites++; print "- " label "CTest " suite ": passed" counts
+                 if (counts == "") { print "release: no count for the " label "CTest suite " suite >"/dev/stderr"; bad = 1 } }
+             END { exit bad || !suites }' "$logs/ctest.log" ||
+            die "${label}ctest.log does not count every suite's tests"
+        for name in $names; do
+            counts=$(sed -n "s/^Ran [0-9]* tests.*/- $label$name: &/p; s/^[0-9]* checks passed.*/- $label$name: &/p" \
+                "$logs/$name.log" "$logs/$name/test.log" 2>/dev/null || :)
+            [ -n "$counts" ] || die "the run's logs do not count $label$name's tests"
+            echo "$counts"
+        done
     done
     echo
     echo "Skipped tests, each with its reason:"
     echo
-    awk 'FNR == 1 { suite = FILENAME; sub(/.*\/logs\//, "", suite); sub(/(\/test)?\.log$/, "", suite) }
-         /^[0-9]+\/[0-9]+ Test: / { suite = "CTest " $3 }
+    set -- "$work/logs/ctest.log" "$work/logs/python.log" "$work"/logs/*/test.log
+    for target in $targets; do
+        case $target in linux-*) set -- "$@" "$(logs_of "$target")/ctest.log" "$(logs_of "$target")/python.log" ;; esac
+    done
+    awk 'FNR == 1 { label = ""
+             if (match(FILENAME, /\/logs-[^\/]+\//)) label = substr(FILENAME, RSTART + 6, RLENGTH - 7) " "
+             suite = FILENAME; sub(/.*\/logs(-[^\/]+)?\//, "", suite); sub(/(\/test)?\.log$/, "", suite)
+             suite = label suite }
+         /^[0-9]+\/[0-9]+ Test: / { suite = label "CTest " $3 }
          /^ +SKIPPED +| \.\.\. skipped |^ *[1-9][0-9]* skip$/ { sub(/^ +(SKIPPED +)?/, ""); print "- " suite ": " $0; found = 1 }
-         END { if (!found) print "None." }' \
-        "$work/logs/ctest.log" "$work/logs/python.log" "$work"/logs/*/test.log
+         END { if (!found) print "None." }' "$@"
     echo
     echo "## Checks outside CI"
     echo
@@ -279,10 +324,38 @@ assets_of() {
         die "cannot list the assets of $tag"
 }
 
-# Die unless release $1 holds exactly the assets $work/expected names.
-whole() {
+# GitHub's lists catch up with a change a few seconds after it: run "$@"
+# until it succeeds, PORTAL_RELEASE_SETTLE times at most, 2 s apart.
+settle() {
+    tries=1
+    until "$@"; do
+        [ "$tries" -lt "${PORTAL_RELEASE_SETTLE:-15}" ] || return 1
+        tries=$((tries + 1))
+        sleep 2
+    done
+}
+
+# Whether GitHub lists a release of $tag, whose ID it then puts in `id`.
+listed() {
+    id=$(releases_of "$tag" | cut -d' ' -f1)
+    [ -n "$id" ]
+}
+
+# Whether release $id is published and immutable.
+published() {
+    [ "$(releases_of "$tag")" = "$id false true" ]
+}
+
+# Whether release $1 holds exactly the assets $work/expected names.
+holds() {
     assets_of "$1" "$work/held"
-    awk '{ print $5 }' "$work/held" | sort | cmp -s "$work/expected" - ||
+    awk '{ print $5 }' "$work/held" | sort | cmp -s "$work/expected" -
+}
+
+# Die, saying $2, unless release $1 holds exactly the assets $work/expected
+# names.
+whole() {
+    settle holds "$1" ||
         die "$2: $tag holds $(awk '{ printf "%s ", $5 }' "$work/held")and should hold" \
             "$(tr '\n' ' ' <"$work/expected")"
 }
@@ -309,23 +382,27 @@ publish() {
     [ "$(echo "$found" | grep -c .)" -le 1 ] ||
         die "$tag has several releases on GitHub, which the owner must settle:" $found
     id=${found%% *}
+    if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+        [ "$(git rev-parse "$tag^{commit}")" = "$release" ] ||
+            die "$tag on GitHub is not $release, the release commit"
+    elif [ -n "$found" ]; then
+        die "$tag has a release on GitHub but no tag"
+    fi
     if [ "$(echo "$found" | cut -d' ' -f2)" = false ]; then
         echo "release: $tag is published already: checking it, changing nothing" >&2
     else
         runtimes "$1"
-        (cd "$work" && zip -qr assets/logs.zip logs)
-        if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            [ "$(git rev-parse "$tag^{commit}")" = "$release" ] ||
-                die "$tag on GitHub is not $release, the release commit"
-        else
+        # Every job's logs: the Mac's and each Linux CPU's.
+        (cd "$work" && for target in $targets; do basename "$(logs_of "$target")"; done |
+            xargs zip -qr assets/logs.zip)
+        if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             git tag -a "$tag" -m "Portal $1" "$release"
             git push -q origin "refs/tags/$tag"
         fi
         if [ -z "$found" ]; then
             gh release create "$tag" --verify-tag --draft --title "Portal $1" \
                 --notes-file "$2" >/dev/null || die "GitHub made no draft of $tag"
-            id=$(releases_of "$tag" | cut -d' ' -f1)
-            [ -n "$id" ] || die "GitHub shows no draft of $tag"
+            settle listed || die "GitHub shows no draft of $tag"
         else
             echo "release: finishing the draft of $tag that an earlier attempt left" >&2
             gh release edit "$tag" --notes-file "$2" >/dev/null
@@ -354,7 +431,7 @@ publish() {
     fi
 
     # Published: what anyone downloads by the tag must be what was tested.
-    [ "$(releases_of "$tag")" = "$id false true" ] ||
+    settle published ||
         die "$tag is published but not immutable, so stable stays: settle it with the owner"
     whole "$id" "$tag is published and stays so, but stable stays: settle it with the owner"
     rm -rf "$work/public" && mkdir "$work/public"
